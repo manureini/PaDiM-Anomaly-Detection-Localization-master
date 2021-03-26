@@ -16,12 +16,39 @@ from skimage import morphology
 from skimage.segmentation import mark_boundaries
 from skimage.io import imread, imsave
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision.models import wide_resnet50_2, resnet18
 from torchvision import transforms as T
 from PIL import Image
 import datasets.mvtec as mvtec
+
+class wide_resnet50_2_cut(nn.Module):
+    def __init__(self, output_layer=None):
+        super().__init__()
+        self.pretrained = wide_resnet50_2(pretrained=True, progress=True)
+        self.output_layer = output_layer
+        self.layers = list(self.pretrained._modules.keys())
+        self.layer_count = 0
+        for l in self.layers:
+            if l != self.output_layer:
+                self.layer_count += 1
+            else:
+                break
+
+        for i in range(1,len(self.layers) - self.layer_count):
+            self.dummy_var = self.pretrained._modules.pop(self.layers[-i])
+        
+        self.net = nn.Sequential(self.pretrained._modules)
+        self.pretrained = None
+        self.layer1 = self.net._modules['layer1']
+        self.layer2 = self.net._modules['layer2']
+        self.layer3 = self.net._modules['layer3']
+
+    def forward(self,x):
+        x = self.net(x)
+        return x
 
 class PaDiMDetector(object):
     """description of class"""
@@ -43,7 +70,7 @@ class PaDiMDetector(object):
             t_d = 448
             d = 100
         elif self.arch == 'wide_resnet50_2':
-            self.model = wide_resnet50_2(pretrained=True, progress=True)
+            self.model = wide_resnet50_2_cut('layer3')
             t_d = 1792
             d = 550
 
@@ -126,9 +153,8 @@ class PaDiMDetector(object):
 
     def check(self, file_name):
         outputs = []
-        test_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', [])])
 
-        x = Image.open(file_name).convert('RGB')
+        x = Image.open(file_name)
         x = self.transform_x(x)
         x = x.unsqueeze(0)
         #x.shape == ([1, 3, 224, 224])
@@ -136,24 +162,25 @@ class PaDiMDetector(object):
         def hook(module, input, output):
             outputs.append(output)
 
-        self.model.layer1[-1].register_forward_hook(hook)
-        self.model.layer2[-1].register_forward_hook(hook)
-        self.model.layer3[-1].register_forward_hook(hook)
-
+        hookhandle1 = self.model.layer1[-1].register_forward_hook(hook)
+        hookhandle2 = self.model.layer2[-1].register_forward_hook(hook)
+        hookhandle3 = self.model.layer3[-1].register_forward_hook(hook)
+                
         with torch.no_grad():
             _ = self.model(x.to(self.device))
 
-        for k, v in zip(test_outputs.keys(), outputs):
-            test_outputs[k].append(v.cpu().detach())
+        hookhandle1.remove();
+        hookhandle2.remove();
+        hookhandle3.remove();
 
-        for k, v in test_outputs.items():
-            test_outputs[k] = torch.cat(v, 0)
-
-        #1, 256, 56, 56
-        # Embedding concat
-        embedding_vectors = test_outputs['layer1']
-        for layer_name in ['layer2', 'layer3']:
-            embedding_vectors = self.embedding_concat(embedding_vectors, test_outputs[layer_name])
+        test_outputs = []
+        test_outputs.append(outputs[0].cpu().detach())
+        test_outputs.append(outputs[1].cpu().detach())
+        test_outputs.append(outputs[2].cpu().detach())
+    
+        embedding_vectors = test_outputs[0]
+        embedding_vectors = self.embedding_concat(embedding_vectors, test_outputs[1])
+        embedding_vectors = self.embedding_concat(embedding_vectors, test_outputs[2])
 
         # randomly select d dimension
         embedding_vectors = torch.index_select(embedding_vectors, 1, self.idx)
@@ -161,15 +188,21 @@ class PaDiMDetector(object):
         # calculate distance matrix
         B, C, H, W = embedding_vectors.size()
         embedding_vectors = embedding_vectors.view(B, C, H * W).numpy()
-        dist_list = []
 
+        dist_list = np.zeros(H * W)
+
+        start = time.time() 
+ 
         for i in range(H * W):
             mean = self.train_outputs[0][:, i]
             conv_inv = self.train_outputs[1][:, :, i]
-            dist = [self.mahalanobis_squared(sample[:, i], mean, conv_inv) for sample in embedding_vectors]
-            dist_list.append(dist)
+            vec = embedding_vectors[0, :, i]
+            dist_list[i] = self.mahalanobis_squared(vec, mean, conv_inv)
 
-        dist_list = np.array(dist_list).transpose(1, 0).reshape(B, H, W)
+        end = time.time()
+        print("for " + str(end - start) + "s")
+
+        dist_list = dist_list.reshape(B, H, W)
 
         # upsample
         dist_list = torch.tensor(dist_list)
@@ -294,7 +327,6 @@ class PaDiMDetector(object):
         fig.tight_layout()
         fig.savefig(os.path.join(save_path, 'roc_curve.png'), dpi=100)
 
-
     def embedding_concat(self, x, y):
         B, C1, H1, W1 = x.size()
         _, C2, H2, W2 = y.size()
@@ -306,7 +338,6 @@ class PaDiMDetector(object):
             z[:, :, i, :, :] = torch.cat((x[:, :, i, :, :], y), 1)
         z = z.view(B, -1, H2 * W2)
         z = F.fold(z, kernel_size=s, output_size=(H1, W1), stride=s)
-
         return z
     
     def denormalization(self, x):
@@ -373,24 +404,33 @@ class PaDiMDetector(object):
             plt.close()
     
 
+def listdir_fullpath(d):
+    result = []
+    for root, subdirs, files in os.walk(d):
+        result.extend([os.path.join(root, f) for f in files])
+    return result
+
 if __name__ == '__main__':
 
     datasetpath = r"D:\Owncloud\HSO\INFM3\images"
     class_name = "orbiter_v2"
 
     detector = PaDiMDetector()
-    #detector.train(datasetpath, class_name)
-    #detector.evaluate(datasetpath, class_name, "results")
-    #detector.save_model()
+    detector.train(datasetpath, class_name)
+    detector.evaluate(datasetpath, class_name, "results")
+    detector.save_model()
     detector.load_model()
-    
-    start = time.time()
-    result = detector.check(r"D:\Owncloud\HSO\INFM3\images\orbiter_v2\test\metal\P01297_niO_000383_Ab_3.png")
-    end = time.time()
-    print(str(end - start) + "s")
-    print(result)
 
-    result = detector.check(r"D:\Owncloud\HSO\INFM3\images\orbiter_v2\test\good\P01297_niO_000271_Ab_0.png")
-    print(result)
+    test_img_dir = r"D:\Owncloud\HSO\INFM3\images\orbiter_v2\test"        
+    list_files = listdir_fullpath(test_img_dir)
+    
+    for filename in list_files:
+        start = time.time()
+        result = detector.check(filename)
+        end = time.time()
+        print(str(end - start) + "s")
+        print(filename + "     " + str(result))
+        print("-----------------------------------------------")
+
 
     
