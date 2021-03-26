@@ -11,7 +11,6 @@ import matplotlib
 import pickle
 import os
 import time
-from scipy.spatial.distance import mahalanobis
 from scipy.ndimage import gaussian_filter
 from skimage import morphology
 from skimage.segmentation import mark_boundaries
@@ -167,7 +166,7 @@ class PaDiMDetector(object):
         for i in range(H * W):
             mean = self.train_outputs[0][:, i]
             conv_inv = self.train_outputs[1][:, :, i]
-            dist = [mahalanobis(sample[:, i], mean, conv_inv) for sample in embedding_vectors]
+            dist = [self.mahalanobis_squared(sample[:, i], mean, conv_inv) for sample in embedding_vectors]
             dist_list.append(dist)
 
         dist_list = np.array(dist_list).transpose(1, 0).reshape(B, H, W)
@@ -242,7 +241,7 @@ class PaDiMDetector(object):
         for i in range(H * W):
             mean = self.train_outputs[0][:, i]
             conv_inv = self.train_outputs[1][:, :, i]
-            dist = [mahalanobis(sample[:, i], mean, conv_inv) for sample in embedding_vectors]
+            dist = [self.mahalanobis_squared(sample[:, i], mean, conv_inv) for sample in embedding_vectors]
             dist_list.append(dist)
 
         dist_list = np.array(dist_list).transpose(1, 0).reshape(B, H, W)
@@ -316,6 +315,10 @@ class PaDiMDetector(object):
         x = (((x.transpose(1, 2, 0) * std) + mean) * 255.).astype(np.uint8)    
         return x
 
+    def mahalanobis_squared(self, u, v, VI):
+        delta = u - v
+        return np.dot(np.dot(delta, VI), delta)
+
     def plot_fig(self, test_img, scores, gts, threshold, save_dir, class_name):
         num = len(scores)
         vmax = scores.max() * 255.
@@ -376,9 +379,9 @@ if __name__ == '__main__':
     class_name = "orbiter_v2"
 
     detector = PaDiMDetector()
-    detector.train(datasetpath, class_name)
-    detector.evaluate(datasetpath, class_name, "results")
-    detector.save_model()
+    #detector.train(datasetpath, class_name)
+    #detector.evaluate(datasetpath, class_name, "results")
+    #detector.save_model()
     detector.load_model()
     
     start = time.time()
