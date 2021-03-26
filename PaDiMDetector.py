@@ -110,8 +110,8 @@ class PaDiMDetector(object):
             # i].numpy()).covariance_
             cov[:, :, i] = np.cov(embedding_vectors[:, :, i].numpy(), rowvar=False) + 0.01 * I
 
-        # save learned distribution
-        self.train_outputs = [mean, cov]
+        conv_inv = np.linalg.inv(cov.T).T
+        self.train_outputs = [mean, conv_inv]
 
     def save_model(self, file_path='model.pkl'):
         with open(file_path, 'wb') as f:
@@ -166,7 +166,7 @@ class PaDiMDetector(object):
 
         for i in range(H * W):
             mean = self.train_outputs[0][:, i]
-            conv_inv = np.linalg.inv(self.train_outputs[1][:, :, i])
+            conv_inv = self.train_outputs[1][:, :, i]
             dist = [mahalanobis(sample[:, i], mean, conv_inv) for sample in embedding_vectors]
             dist_list.append(dist)
 
@@ -186,7 +186,7 @@ class PaDiMDetector(object):
         #heat_map = scores * 255
         #imsave("out.png", heat_map)
 
-        return img_scores > threshold
+        return img_scores > self.threshold
 
     def evaluate(self, data_path, class_name, save_path):
         test_dataset = mvtec.MVTecDataset(data_path, class_name=class_name, is_train=False)
@@ -241,7 +241,7 @@ class PaDiMDetector(object):
 
         for i in range(H * W):
             mean = self.train_outputs[0][:, i]
-            conv_inv = np.linalg.inv(self.train_outputs[1][:, :, i])
+            conv_inv = self.train_outputs[1][:, :, i]
             dist = [mahalanobis(sample[:, i], mean, conv_inv) for sample in embedding_vectors]
             dist_list.append(dist)
 
