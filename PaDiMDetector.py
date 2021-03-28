@@ -24,6 +24,8 @@ from torchvision import transforms as T
 from PIL import Image
 import datasets.mvtec as mvtec
 
+IMG_SIZE = 256
+
 class wide_resnet50_2_cut(nn.Module):
     def __init__(self, output_layer=None):
         super().__init__()
@@ -79,8 +81,8 @@ class PaDiMDetector(object):
 
         self.idx = torch.tensor(sample(range(0, t_d), d))
 
-        self.transform_x = T.Compose([T.Resize(256, Image.ANTIALIAS),
-                                      T.CenterCrop(224),
+        self.transform_x = T.Compose([T.Resize((IMG_SIZE,IMG_SIZE), Image.ANTIALIAS),
+                                     # T.CenterCrop(224),
                                       T.ToTensor(),
                                       T.Normalize(mean=[0.485, 0.456, 0.406],
                                                   std=[0.229, 0.224, 0.225])])
@@ -97,7 +99,7 @@ class PaDiMDetector(object):
         self.model.layer2[-1].register_forward_hook(hook)
         self.model.layer3[-1].register_forward_hook(hook)
 
-        train_dataset = mvtec.MVTecDataset(data_path, class_name=class_name, is_train=True)
+        train_dataset = mvtec.MVTecDataset(data_path, class_name=class_name, is_train=True, resize=(IMG_SIZE,IMG_SIZE), cropsize = IMG_SIZE)
         train_dataloader = DataLoader(train_dataset, batch_size=32, pin_memory=True)
     
         train_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', [])])   
@@ -141,7 +143,7 @@ class PaDiMDetector(object):
 
     def save_model(self, file_path='model.pkl'):
         with open(file_path, 'wb') as f:
-            pickle.dump(self.train_outputs, f)
+            pickle.dump(self.train_outputs, f, protocol=pickle.HIGHEST_PROTOCOL)
         with open(file_path + '.values', 'wb') as f:
             pickle.dump([self.min_score, self.max_score, self.threshold], f)
 
@@ -169,9 +171,9 @@ class PaDiMDetector(object):
         with torch.no_grad():
             _ = self.model(x.to(self.device))
 
-        hookhandle1.remove();
-        hookhandle2.remove();
-        hookhandle3.remove();
+        hookhandle1.remove()
+        hookhandle2.remove()
+        hookhandle3.remove()
 
         test_outputs = []
         test_outputs.append(outputs[0].cpu().detach())
@@ -221,7 +223,7 @@ class PaDiMDetector(object):
         return img_scores > self.threshold
 
     def evaluate(self, data_path, class_name, save_path):
-        test_dataset = mvtec.MVTecDataset(data_path, class_name=class_name, is_train=False)
+        test_dataset = mvtec.MVTecDataset(data_path, class_name=class_name, is_train=False, resize=(IMG_SIZE,IMG_SIZE), cropsize = IMG_SIZE)
         test_dataloader = DataLoader(test_dataset, batch_size=32, pin_memory=True)
         test_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', [])])
         
