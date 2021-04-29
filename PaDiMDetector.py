@@ -5,7 +5,8 @@ from tqdm import tqdm
 from collections import OrderedDict
 from sklearn.metrics import roc_auc_score
 from sklearn.metrics import roc_curve
-from sklearn.metrics import precision_recall_curve
+from sklearn.metrics import precision_recall_curve, average_precision_score
+from sklearn.metrics import confusion_matrix
 import matplotlib.pyplot as plt
 import matplotlib
 import pickle
@@ -314,12 +315,41 @@ class PaDiMDetector(object):
         b = precision + recall
         f1 = np.divide(a, b, out=np.zeros_like(a), where=b != 0)
         self.threshold = thresholds[np.argmax(f1)]
+
         print('Threshold: ' + str(self.threshold))
 
         # calculate per-pixel level ROCAUC
         fpr, tpr, _ = roc_curve(gt_mask.flatten(), scores.flatten())
         per_pixel_rocauc = roc_auc_score(gt_mask.flatten(), scores.flatten())
         print('pixel ROCAUC: %.3f' % (per_pixel_rocauc))
+                
+        det_auc_score = roc_auc_score(gt_list, img_scores)
+        det_pr_score = average_precision_score(gt_list, img_scores)
+        
+        # auc score (per pixel level) for segmentation
+        seg_auc_score = roc_auc_score(gt_mask.flatten(), scores.flatten())
+        seg_pr_score = average_precision_score(gt_mask.flatten(), scores.flatten())
+
+        # metrics over all data
+        print(f"Det AUC: {det_auc_score:.4f}, Seg AUC: {seg_auc_score:.4f}")
+        print(f"Det PR: {det_pr_score:.4f}, Seg PR: {seg_pr_score:.4f}")
+
+        
+        self.threshold = self.threshold * 0.6
+
+        scores_boolean = img_scores > self.threshold
+
+        confm = confusion_matrix(gt_list, scores_boolean)
+        print(confm)
+
+        tn, fp, fn, tp = confusion_matrix(gt_list, scores_boolean).ravel()
+        print(f"tn: {tn}      fp: {fp}      fn: {fn}      tp: {tp}")
+
+        det_auc_score = roc_auc_score(gt_list, scores_boolean)
+        det_pr_score = average_precision_score(gt_list, scores_boolean)
+
+        print(f"Det AUC: {det_auc_score:.4f}")
+        print(f"Det PR: {det_pr_score:.4f}")
 
         fig_pixel_rocauc.plot(fpr, tpr, label='%s ROCAUC: %.3f' % (class_name, per_pixel_rocauc))
         save_dir = save_path + '/' + f'pictures_{self.arch}'
@@ -415,15 +445,15 @@ def listdir_fullpath(d):
 if __name__ == '__main__':
 
     datasetpath = r"D:\Owncloud\HSO\INFM3\images"
-    class_name = "orbiter_v2"
+    class_name = "orbiter_v1"
 
     detector = PaDiMDetector()
     detector.train(datasetpath, class_name)
+    detector.load_model()
     detector.evaluate(datasetpath, class_name, "results")
     detector.save_model()
-    detector.load_model()
-
-    test_img_dir = r"D:\Owncloud\HSO\INFM3\images\orbiter_v2\test"        
+  
+    test_img_dir = os.path.join(datasetpath, class_name, "test") 
     list_files = listdir_fullpath(test_img_dir)
     
     for filename in list_files:
