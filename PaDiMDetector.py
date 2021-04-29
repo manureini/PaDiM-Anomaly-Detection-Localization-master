@@ -449,9 +449,9 @@ if __name__ == '__main__':
 
     detector = PaDiMDetector()
     detector.train(datasetpath, class_name)
-    detector.load_model()
     detector.evaluate(datasetpath, class_name, "results")
     detector.save_model()
+#    detector.load_model()
   
     test_img_dir = os.path.join(datasetpath, class_name, "test") 
     list_files = listdir_fullpath(test_img_dir)
