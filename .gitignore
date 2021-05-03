@@ -263,3 +263,5 @@ __pycache__/
 
 orbiter_v1_results/*
 orbiter_v2_results/*
+*.png
+*.pkl

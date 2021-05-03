@@ -56,9 +56,11 @@ class wide_resnet50_2_cut(nn.Module):
 class PaDiMDetector(object):
     """description of class"""
 
-    def __init__(self, arch='wide_resnet50_2', random_seed=1024):
+    def __init__(self, model_count, model_selector, arch='wide_resnet50_2', random_seed=1024):
         self.arch = arch
         self.random_seed = random_seed
+        self.model_count = model_count
+        self.model_selector = model_selector
 
         random.seed(random_seed)
         torch.manual_seed(random_seed)
@@ -67,19 +69,25 @@ class PaDiMDetector(object):
         use_cuda = torch.cuda.is_available()
         self.device = torch.device('cuda' if use_cuda else 'cpu')
 
-        # load model
-        if self.arch == 'resnet18':
-            self.model = resnet18(pretrained=True, progress=True)
-            t_d = 448
-            d = 100
-        elif self.arch == 'wide_resnet50_2':
-            self.model = wide_resnet50_2_cut('layer3')
-            t_d = 1792
-            d = 550
+        self.models = []
 
-        self.model.to(self.device)
-        self.model.eval()
+        for i in range(self.model_count):
+            if self.arch == 'resnet18':
+                model = resnet18(pretrained=True, progress=True)
+                model.to(self.device)
+                model.eval()
+                self.models.append(model)
+                t_d = 448
+                d = 100
+            elif self.arch == 'wide_resnet50_2':
+                model = wide_resnet50_2_cut('layer3')
+                model.to(self.device)
+                model.eval()
+                self.models.append(model)
+                t_d = 1792
+                d = 550
 
+  
         self.idx = torch.tensor(sample(range(0, t_d), d))
 
         self.transform_x = T.Compose([T.Resize((IMG_SIZE,IMG_SIZE), Image.ANTIALIAS),
@@ -96,65 +104,73 @@ class PaDiMDetector(object):
         def hook(module, input, output):
             outputs.append(output)
 
-        self.model.layer1[-1].register_forward_hook(hook)
-        self.model.layer2[-1].register_forward_hook(hook)
-        self.model.layer3[-1].register_forward_hook(hook)
+        for i in range(self.model_count):
+            self.models[i].layer1[-1].register_forward_hook(hook)
+            self.models[i].layer2[-1].register_forward_hook(hook)
+            self.models[i].layer3[-1].register_forward_hook(hook)
 
         train_dataset = mvtec.MVTecDataset(data_path, class_name=class_name, is_train=True, resize=(IMG_SIZE,IMG_SIZE), cropsize = IMG_SIZE)
-        train_dataloader = DataLoader(train_dataset, batch_size=32, pin_memory=True)
+        train_dataloader = DataLoader(train_dataset, batch_size=1, pin_memory=True)
     
-        train_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', [])])   
+        self.train_outputs = []
+        train_outputs = []
+        for i in range(self.model_count):
+            train_outputs.append(OrderedDict([('layer1', []), ('layer2', []), ('layer3', [])]))
         
-        for (x, _, _, _) in tqdm(train_dataloader, '| feature extraction | train | %s |' % class_name):
+        for (x, _, _, file) in tqdm(train_dataloader, '| feature extraction | train | %s |' % class_name):
+            model_index = self.model_selector(file)
+            model = self.models[model_index]
+
             # model prediction
             with torch.no_grad():
-                _ = self.model(x.to(self.device))
+                _ = model(x.to(self.device))
             # get intermediate layer outputs
-            for k, v in zip(train_outputs.keys(), outputs):
-                train_outputs[k].append(v.cpu().detach())
+            for k, v in zip(train_outputs[model_index].keys(), outputs):
+                train_outputs[model_index][k].append(v.cpu().detach())
             # clear hook outputs
             outputs = []
 
-        for k, v in train_outputs.items():
-            train_outputs[k] = torch.cat(v, 0)
+        for i in range(self.model_count):
+            for k, v in train_outputs[i].items():
+                train_outputs[i][k] = torch.cat(v, 0)
 
-        # Embedding concat
-        embedding_vectors = train_outputs['layer1']
-        for layer_name in ['layer2', 'layer3']:
-            embedding_vectors = self.embedding_concat(embedding_vectors, train_outputs[layer_name])
+            # Embedding concat
+            embedding_vectors = train_outputs[i]['layer1']
+            for layer_name in ['layer2', 'layer3']:
+                embedding_vectors = self.embedding_concat(embedding_vectors, train_outputs[i][layer_name])
 
-        # randomly select d dimension
-        embedding_vectors = torch.index_select(embedding_vectors, 1, self.idx)
+            # randomly select d dimension
+            embedding_vectors = torch.index_select(embedding_vectors, 1, self.idx)
 
-        # calculate multivariate Gaussian distribution
-        B, C, H, W = embedding_vectors.size()
-        embedding_vectors = embedding_vectors.view(B, C, H * W)
-        mean = torch.mean(embedding_vectors, dim=0).numpy()
-        cov = torch.zeros(C, C, H * W).numpy()
+            # calculate multivariate Gaussian distribution
+            B, C, H, W = embedding_vectors.size()
+            embedding_vectors = embedding_vectors.view(B, C, H * W)
+            mean = torch.mean(embedding_vectors, dim=0).numpy()
+            cov = torch.zeros(C, C, H * W).numpy()
 
-        I = np.identity(C)
+            I = np.identity(C)
 
-        for i in range(H * W):
-            # cov[:, :, i] = LedoitWolf().fit(embedding_vectors[:, :,
-            # i].numpy()).covariance_
-            cov[:, :, i] = np.cov(embedding_vectors[:, :, i].numpy(), rowvar=False) + 0.01 * I
+            for i in range(H * W):
+                # cov[:, :, i] = LedoitWolf().fit(embedding_vectors[:, :,
+                # i].numpy()).covariance_
+                cov[:, :, i] = np.cov(embedding_vectors[:, :, i].numpy(), rowvar=False) + 0.01 * I
 
-        conv_inv = np.linalg.inv(cov.T).T
-        self.train_outputs = [mean, conv_inv]
+            conv_inv = np.linalg.inv(cov.T).T
+            self.train_outputs.append([mean, conv_inv])
 
     def save_model(self, file_path='model.pkl'):
         with open(file_path, 'wb') as f:
             pickle.dump(self.train_outputs, f, protocol=pickle.HIGHEST_PROTOCOL)
-        with open(file_path + '.values', 'wb') as f:
-            pickle.dump([self.min_score, self.max_score, self.threshold], f)
+#        with open(file_path + '.values', 'wb') as f:
+#            pickle.dump([self.min_score, self.max_score, self.threshold], f)
 
     def load_model(self, file_path='model.pkl'):
         with open(file_path, 'rb') as f:
             self.train_outputs = pickle.load(f)
-        with open(file_path + '.values', 'rb') as f:
-            self.min_score, self.max_score, self.threshold = pickle.load(f)
+#        with open(file_path + '.values', 'rb') as f:
+#            self.min_score, self.max_score, self.threshold = pickle.load(f)
 
-    def check(self, file_name):
+    def check(self, file_name, isTraining=False):
         outputs = []
 
         x = Image.open(file_name)
@@ -165,12 +181,15 @@ class PaDiMDetector(object):
         def hook(module, input, output):
             outputs.append(output)
 
-        hookhandle1 = self.model.layer1[-1].register_forward_hook(hook)
-        hookhandle2 = self.model.layer2[-1].register_forward_hook(hook)
-        hookhandle3 = self.model.layer3[-1].register_forward_hook(hook)
+        model_index = self.model_selector(file_name)
+        model = self.models[model_index]
+
+        hookhandle1 = model.layer1[-1].register_forward_hook(hook)
+        hookhandle2 = model.layer2[-1].register_forward_hook(hook)
+        hookhandle3 = model.layer3[-1].register_forward_hook(hook)
                 
         with torch.no_grad():
-            _ = self.model(x.to(self.device))
+            _ = model(x.to(self.device))
 
         hookhandle1.remove()
         hookhandle2.remove()
@@ -197,8 +216,8 @@ class PaDiMDetector(object):
         start = time.time() 
  
         for i in range(H * W):
-            mean = self.train_outputs[0][:, i]
-            conv_inv = self.train_outputs[1][:, :, i]
+            mean = self.train_outputs[model_index][0][:, i]
+            conv_inv = self.train_outputs[model_index][1][:, :, i]
             vec = embedding_vectors[0, :, i]
             dist_list[i] = self.mahalanobis_squared(vec, mean, conv_inv)
 
@@ -213,82 +232,38 @@ class PaDiMDetector(object):
         
         score_map = gaussian_filter(score_map, sigma=4)
         
-        # Normalization
-        scores = (score_map - self.min_score) / (self.max_score - self.min_score)
+        result = None
 
-        img_scores = scores.max()
-        
+        if not isTraining:
+            # Normalization
+            scores = (score_map - self.min_score) / (self.max_score - self.min_score)
+            img_scores = scores.max()
+            result = img_scores > self.threshold
+
         #heat_map = scores * 255
         #imsave("out.png", heat_map)
 
-        return img_scores > self.threshold
+        return result, score_map
 
     def evaluate(self, data_path, class_name, save_path):
         test_dataset = mvtec.MVTecDataset(data_path, class_name=class_name, is_train=False, resize=(IMG_SIZE,IMG_SIZE), cropsize = IMG_SIZE)
-        test_dataloader = DataLoader(test_dataset, batch_size=32, pin_memory=True)
-        test_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', [])])
-        
+        test_dataloader = DataLoader(test_dataset, batch_size=1, pin_memory=True)
+               
         gt_list = []
         gt_mask_list = []
         test_imgs = []    
 
-        outputs = []
+        score_map = []
+        for (x, y, mask, file) in tqdm(test_dataloader, '| feature extraction | test | %s |' % class_name):           
+            _, score = self.check(file[0], True)        
+            score_map.append(score)
 
-        def hook(module, input, output):
-            outputs.append(output)
-
-        self.model.layer1[-1].register_forward_hook(hook)
-        self.model.layer2[-1].register_forward_hook(hook)
-        self.model.layer3[-1].register_forward_hook(hook)
-
-        # extract test set features
-        for (x, y, mask, _) in tqdm(test_dataloader, '| feature extraction | test | %s |' % class_name):
             test_imgs.extend(x.cpu().detach().numpy())
             gt_list.extend(y.cpu().detach().numpy())
             gt_mask_list.extend(mask.cpu().detach().numpy())
 
-            # model prediction
-            with torch.no_grad():
-                _ = self.model(x.to(self.device))
-
-            # get intermediate layer outputs
-            for k, v in zip(test_outputs.keys(), outputs):
-                test_outputs[k].append(v.cpu().detach())
-
-            # clear hook outputs
-            outputs = []
-
-        for k, v in test_outputs.items():
-            test_outputs[k] = torch.cat(v, 0)
-        
-        # Embedding concat
-        embedding_vectors = test_outputs['layer1']
-        for layer_name in ['layer2', 'layer3']:
-            embedding_vectors = self.embedding_concat(embedding_vectors, test_outputs[layer_name])
-
-        # randomly select d dimension
-        embedding_vectors = torch.index_select(embedding_vectors, 1, self.idx)
-        
-        # calculate distance matrix
-        B, C, H, W = embedding_vectors.size()
-        embedding_vectors = embedding_vectors.view(B, C, H * W).numpy()
-        dist_list = []
-
-        for i in range(H * W):
-            mean = self.train_outputs[0][:, i]
-            conv_inv = self.train_outputs[1][:, :, i]
-            dist = [self.mahalanobis_squared(sample[:, i], mean, conv_inv) for sample in embedding_vectors]
-            dist_list.append(dist)
-
-        dist_list = np.array(dist_list).transpose(1, 0).reshape(B, H, W)
-
-        # upsample
-        dist_list = torch.tensor(dist_list)
-        score_map = F.interpolate(dist_list.unsqueeze(1), size=x.size(2), mode='bilinear', align_corners=False).squeeze().numpy()
-        
-        # apply gaussian smoothing on the score map
-        for i in range(score_map.shape[0]):
-            score_map[i] = gaussian_filter(score_map[i], sigma=4)
+        score_map = np.array(score_map)    
+        #(316, 256, 256)
         
         # Normalization
         self.max_score = score_map.max()
@@ -445,12 +420,22 @@ def listdir_fullpath(d):
 if __name__ == '__main__':
 
     datasetpath = r"D:\data"
-    class_name = "orbiter_v1_patches"
+    class_name = "orbiter_v2_patches"
 
-    detector = PaDiMDetector()
+    def getModelIndex(x):
+        file = x
+        if(type(file) == list):
+            file = file[0]
+        file = file[:-4]
+        file = file[-1]
+        return int(file)
+
+    detector = PaDiMDetector(2, getModelIndex)
     detector.train(datasetpath, class_name)
+#    detector.save_model()
+#    detector.load_model()
     detector.evaluate(datasetpath, class_name, "results")
-    detector.save_model()
+#    detector.save_model()
 #    detector.load_model()
   
     test_img_dir = os.path.join(datasetpath, class_name, "test") 
@@ -458,7 +443,7 @@ if __name__ == '__main__':
     
     for filename in list_files:
         start = time.time()
-        result = detector.check(filename)
+        result = detector.check(filename, True)
         end = time.time()
         print(str(end - start) + "s")
         print(filename + "     " + str(result))

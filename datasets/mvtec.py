@@ -34,18 +34,18 @@ class MVTecDataset(Dataset):
 
         # set transforms
         self.transform_x = T.Compose([T.Resize(resize, Image.ANTIALIAS),
-                                      T.CenterCrop(cropsize),
+                                      #T.CenterCrop(cropsize),
                                       T.ToTensor(),
                                       T.Normalize(mean=[0.485, 0.456, 0.406],
                                                   std=[0.229, 0.224, 0.225])])
         self.transform_mask = T.Compose([T.Resize(resize, Image.NEAREST),
-                                         T.CenterCrop(cropsize),
+                                         #T.CenterCrop(cropsize),
                                          T.ToTensor()])
 
     def __getitem__(self, idx):
-        x, y, mask = self.x[idx], self.y[idx], self.mask[idx]
+        file, y, mask = self.x[idx], self.y[idx], self.mask[idx]
 
-        x = Image.open(x).convert('RGB')
+        x = Image.open(file).convert('RGB')
         x = self.transform_x(x)
 
         if y == 0:
@@ -54,7 +54,7 @@ class MVTecDataset(Dataset):
             mask = Image.open(mask)
             mask = self.transform_mask(mask)
 
-        return x, y, mask
+        return x, y, mask, file
 
     def __len__(self):
         return len(self.x)
