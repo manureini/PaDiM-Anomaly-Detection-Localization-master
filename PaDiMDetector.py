@@ -24,6 +24,7 @@ from torchvision.models import wide_resnet50_2, resnet18
 from torchvision import transforms as T
 from PIL import Image
 import datasets.mvtec as mvtec
+from joblib import Parallel, delayed
 
 IMG_SIZE = 256
 
@@ -154,10 +155,18 @@ class PaDiMDetector(object):
         with open(file_path + '.values', 'rb') as f:
             self.min_score, self.max_score, self.threshold = pickle.load(f)
 
-    def check(self, file_name):
+    def calcDistance(self, i):
+        mean = self.train_outputs[0][:, i]
+        conv_inv = self.train_outputs[1][:, :, i]
+        vec = self.embedding_vectors[0, :, i]
+        return self.mahalanobis_squared(vec, mean, conv_inv)
+
+    def check(self, file_name, threshold = None):
         outputs = []
 
         x = Image.open(file_name)
+
+        start = time.time()
         x = self.transform_x(x)
         x = x.unsqueeze(0)
         #x.shape == ([1, 3, 224, 224])
@@ -192,19 +201,22 @@ class PaDiMDetector(object):
         B, C, H, W = embedding_vectors.size()
         embedding_vectors = embedding_vectors.view(B, C, H * W).numpy()
 
+        #self.embedding_vectors = embedding_vectors
+        #embedding_vectors = None
+        #dist_list = Parallel(n_jobs=-1,
+        #require='sharedmem')(delayed(self.calcDistance)(i) for i in range(H *
+        #W))
+        #self.embedding_vectors = None
+        #dist_list = np.array(dist_list)
+
         dist_list = np.zeros(H * W)
 
-        start = time.time() 
- 
         for i in range(H * W):
             mean = self.train_outputs[0][:, i]
             conv_inv = self.train_outputs[1][:, :, i]
             vec = embedding_vectors[0, :, i]
             dist_list[i] = self.mahalanobis_squared(vec, mean, conv_inv)
-
-        end = time.time()
-        print("for " + str(end - start) + "s")
-
+  
         dist_list = dist_list.reshape(B, H, W)
 
         # upsample
@@ -221,7 +233,13 @@ class PaDiMDetector(object):
         #heat_map = scores * 255
         #imsave("out.png", heat_map)
 
-        return img_scores > self.threshold
+        if threshold is None:
+            threshold = self.threshold            
+
+        end = time.time()
+        print("took " + str(end - start) + "s")
+
+        return img_scores > threshold
 
     def evaluate(self, data_path, class_name, save_path):
         test_dataset = mvtec.MVTecDataset(data_path, class_name=class_name, is_train=False, resize=(IMG_SIZE,IMG_SIZE), cropsize = IMG_SIZE)
@@ -230,7 +248,8 @@ class PaDiMDetector(object):
         
         gt_list = []
         gt_mask_list = []
-        test_imgs = []    
+        test_imgs = []
+        test_imgs_names = []
 
         outputs = []
 
@@ -242,8 +261,9 @@ class PaDiMDetector(object):
         self.model.layer3[-1].register_forward_hook(hook)
 
         # extract test set features
-        for (x, y, mask, _) in tqdm(test_dataloader, '| feature extraction | test | %s |' % class_name):
+        for (x, y, mask, file) in tqdm(test_dataloader, '| feature extraction | test | %s |' % class_name):
             test_imgs.extend(x.cpu().detach().numpy())
+            test_imgs_names.extend(file)
             gt_list.extend(y.cpu().detach().numpy())
             gt_mask_list.extend(mask.cpu().detach().numpy())
 
@@ -333,9 +353,9 @@ class PaDiMDetector(object):
         # metrics over all data
         print(f"Det AUC: {det_auc_score:.4f}, Seg AUC: {seg_auc_score:.4f}")
         print(f"Det PR: {det_pr_score:.4f}, Seg PR: {seg_pr_score:.4f}")
-
         
-        self.threshold = self.threshold * 0.6
+        #self.threshold = 0.36940035223960876
+        self.threshold = 0.3166288733482361
 
         scores_boolean = img_scores > self.threshold
 
@@ -353,8 +373,9 @@ class PaDiMDetector(object):
 
         fig_pixel_rocauc.plot(fpr, tpr, label='%s ROCAUC: %.3f' % (class_name, per_pixel_rocauc))
         save_dir = save_path + '/' + f'pictures_{self.arch}'
+
         os.makedirs(save_dir, exist_ok=True)
-        self.plot_fig(test_imgs, scores, gt_mask_list, self.threshold, save_dir, class_name)
+        self.plot_fig(test_imgs, test_imgs_names, scores, gt_mask_list, self.threshold, save_dir, class_name)
 
         fig.tight_layout()
         fig.savefig(os.path.join(save_path, 'roc_curve.png'), dpi=100)
@@ -382,57 +403,66 @@ class PaDiMDetector(object):
         delta = u - v
         return np.dot(np.dot(delta, VI), delta)
 
-    def plot_fig(self, test_img, scores, gts, threshold, save_dir, class_name):
+    def plot_fig(self, test_img, test_imgs_names, scores, gts, threshold, save_dir, class_name):
         num = len(scores)
         vmax = scores.max() * 255.
         vmin = scores.min() * 255.
         for i in range(num):
             img = test_img[i]
+            file = test_imgs_names[i]
             img = self.denormalization(img)
             gt = gts[i].transpose(1, 2, 0).squeeze()
             heat_map = scores[i] * 255
             mask = scores[i]
-            mask[mask > threshold] = 1
             mask[mask <= threshold] = 0
+            mask[mask > threshold] = 1
             kernel = morphology.disk(4)
             mask = morphology.opening(mask, kernel)
             mask *= 255
             vis_img = mark_boundaries(img, mask, color=(1, 0, 0), mode='thick')
-            fig_img, ax_img = plt.subplots(1, 5, figsize=(12, 3))
-            fig_img.subplots_adjust(right=0.9)
+
+            fig_img, ax_img = plt.subplots(1, 5, gridspec_kw = {'wspace':0, 'hspace':0})
+            fig_img.subplots_adjust(left=None, bottom=None, right=None, top=None, wspace=None, hspace=None)
             norm = matplotlib.colors.Normalize(vmin=vmin, vmax=vmax)
             for ax_i in ax_img:
                 ax_i.axes.xaxis.set_visible(False)
                 ax_i.axes.yaxis.set_visible(False)
+                ax_i.set_xticks([])
+                ax_i.set_xticklabels([])
+                ax_i.set_yticks([])
+                ax_i.set_yticklabels([])
+                ax_i.set_axis_off()
+
             ax_img[0].imshow(img)
-            ax_img[0].title.set_text('Image')
+            #ax_img[0].title.set_text('Image')
             ax_img[1].imshow(gt, cmap='gray')
-            ax_img[1].title.set_text('GroundTruth')
-            ax = ax_img[2].imshow(heat_map, cmap='jet', norm=norm)
-            ax_img[2].imshow(img, cmap='gray', interpolation='none')
-            ax_img[2].imshow(heat_map, cmap='jet', alpha=0.5, interpolation='none')
-            ax_img[2].title.set_text('Predicted heat map')
+            #ax_img[1].title.set_text('GroundTruth')
+            ax_img[2].imshow(heat_map, cmap='jet', norm=norm)
+            #ax_img[2].imshow(img, cmap='gray', interpolation='none')
+            #ax_img[2].imshow(heat_map, cmap='jet', alpha=0.5,
+            #interpolation='none')
+            #ax_img[2].title.set_text('Predicted heat map')
             ax_img[3].imshow(mask, cmap='gray')
-            ax_img[3].title.set_text('Predicted mask')
+            #ax_img[3].title.set_text('Predicted mask')
             ax_img[4].imshow(vis_img)
-            ax_img[4].title.set_text('Segmentation result')
+            #ax_img[4].title.set_text('Segmentation result')
             left = 0.92
             bottom = 0.15
             width = 0.015
             height = 1 - 2 * bottom
             rect = [left, bottom, width, height]
-            cbar_ax = fig_img.add_axes(rect)
-            cb = plt.colorbar(ax, shrink=0.6, cax=cbar_ax, fraction=0.046)
-            cb.ax.tick_params(labelsize=8)
+            #cbar_ax = fig_img.add_axes(rect)
+            #cb = plt.colorbar(ax, shrink=0.6, cax=cbar_ax, fraction=0.046)
+            #cb.ax.tick_params(labelsize=8)
             font = {
                 'family': 'serif',
                 'color': 'black',
                 'weight': 'normal',
                 'size': 8,
             }
-            cb.set_label('Anomaly Score', fontdict=font)
-    
-            fig_img.savefig(os.path.join(save_dir, class_name + '_{}'.format(i)), dpi=100)
+            #cb.set_label('Anomaly Score', fontdict=font)
+            head, tail = os.path.split(file)
+            fig_img.savefig(os.path.join(save_dir, tail), dpi=300, bbox_inches='tight', pad_inches=0)
             plt.close()
     
 
@@ -445,13 +475,13 @@ def listdir_fullpath(d):
 if __name__ == '__main__':
 
     datasetpath = r"D:\data"
-    class_name = "orbiter_v1_patches"
+    class_name = "orbiter_v2"
 
     detector = PaDiMDetector()
-    detector.train(datasetpath, class_name)
+    detector.load_model()
+#    detector.train(datasetpath, class_name)
     detector.evaluate(datasetpath, class_name, "results")
-    detector.save_model()
-#    detector.load_model()
+#    detector.save_model()
   
     test_img_dir = os.path.join(datasetpath, class_name, "test") 
     list_files = listdir_fullpath(test_img_dir)
@@ -462,6 +492,9 @@ if __name__ == '__main__':
         end = time.time()
         print(str(end - start) + "s")
         print(filename + "     " + str(result))
+        isGood = "good" in filename
+        if isGood != (not result):
+            print("WRONG!!!!!!!!!!")
         print("-----------------------------------------------")
 
 
